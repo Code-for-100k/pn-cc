@@ -23,7 +23,6 @@ module PnCC where
 
 import DA.Date (Date)
 import DA.Time (Time)
-import Daml.Script
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- PriceObservation
