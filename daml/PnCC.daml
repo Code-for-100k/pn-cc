@@ -21,8 +21,7 @@
 
 module PnCC where
 
-import DA.Date (Date)
-import DA.Time (Time)
+-- Date and Time are Prelude types in DAML 2.9.x — no import needed
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- PriceObservation
