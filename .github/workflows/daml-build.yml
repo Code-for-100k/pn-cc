@@ -1,0 +1,31 @@
+name: DAML Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install DAML SDK
+        run: |
+          curl -sSL https://get.daml.com/ | sh -s 2.9.4
+          echo "$HOME/.daml/bin" >> $GITHUB_PATH
+
+      - name: Build DAR
+        run: daml build
+
+      - name: Run scripts (sandbox)
+        run: daml test
+
+      - name: Upload DAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pn-cc-dar
+          path: .daml/dist/pn-cc-0.1.0.dar
+          retention-days: 30
