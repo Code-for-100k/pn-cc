@@ -173,7 +173,12 @@ template PCC
 
     -- Burn P_CC at maturity and create a SettlementClaim.
     -- Uses the SettlementPool's maturityPrice to compute payout.
-    -- Invariant check: payout for P + N = ccDeposited ✓ (enforced by formula)
+    -- Invariant: payout for P + N = ccDeposited ✓ (enforced by formula)
+    --
+    -- Visibility note: SettlementPool is visible to admin only (signatory admin).
+    -- Token holders must submit with readAs:[admin] OR rely on Canton explicit
+    -- disclosure (pass pool contract data in the command payload). In DAML Script
+    -- tests, use submitMulti [owner] [admin] to lend admin visibility.
     choice PCC_ClaimSettlement : ContractId SettlementClaim
       with poolCid : ContractId SettlementPool
       controller owner
@@ -224,6 +229,8 @@ template NCC
       do
         create this with owner = newOwner
 
+    -- Same visibility note as PCC_ClaimSettlement: submit with readAs:[admin]
+    -- or use Canton explicit disclosure.
     choice NCC_ClaimSettlement : ContractId SettlementClaim
       with poolCid : ContractId SettlementPool
       controller owner

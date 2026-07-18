@@ -110,12 +110,15 @@ fullLifecycle = script do
 
   -- ── Alice claims P_CC settlement ──────────────────────────────────────────
   -- Expected: min(0.18, 0.12) / 0.18 × 1000 = 666.666... CC
-  alicePClaimCid <- submit alice do
+  -- submitMulti: alice is actAs (controls PCC), admin is readAs (provides
+  -- visibility of SettlementPool). In production Canton, users submit with
+  -- readAs: [admin] or rely on explicit disclosure from the wallet.
+  alicePClaimCid <- submitMulti [alice] [admin] do
     exerciseCmd alicePCid PCC_ClaimSettlement with poolCid = poolCid
 
   -- ── Bob claims N_CC settlement ────────────────────────────────────────────
   -- Expected: max(0, 0.18 − 0.12) / 0.18 × 1000 = 333.333... CC
-  bobNClaimCid <- submit bob do
+  bobNClaimCid <- submitMulti [bob] [admin] do
     exerciseCmd bobNCid NCC_ClaimSettlement with poolCid = poolCid
 
   -- ── Admin pays both claims (off-chain CC transfer done) ──────────────────
@@ -198,9 +201,10 @@ belowStrikeTest = script do
       strikePrice = strikePrice; totalCC = 200.0; openedAt = now
 
   -- Dan claims both P_CC (gets all 200 CC) and N_CC (gets 0 CC)
-  danPClaimCid <- submit dan do
+  -- submitMulti: dan actAs, admin readAs (SettlementPool visibility)
+  danPClaimCid <- submitMulti [dan] [admin] do
     exerciseCmd danPCid PCC_ClaimSettlement with poolCid = poolCid
-  danNClaimCid <- submit dan do
+  danNClaimCid <- submitMulti [dan] [admin] do
     exerciseCmd danNCid NCC_ClaimSettlement with poolCid = poolCid
 
   submit admin do exerciseCmd danPClaimCid SettlementClaim_MarkPaid
