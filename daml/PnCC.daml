@@ -1,10 +1,20 @@
 -- P_CC / N_CC: option-based synthetic stable on Canton
 -- Mechanism: Vitalik Buterin's P/N token split applied to Canton Coin (CC)
 --
--- Split invariant: P_CC payoff + N_CC payoff = ccDeposited (in CC terms)
---   P_CC payoff = min(P_mat, K) / P_mat × ccDeposited   (stable, floored)
+-- Split invariant: P_CC payoff + N_CC payoff = ccDeposited (in CC terms, always)
+--
+-- Payout formulas (CC amounts at settlement):
+--   P_CC payoff = min(P_mat, K) / P_mat × ccDeposited   (stable, floored at K)
 --   N_CC payoff = max(0, P_mat − K) / P_mat × ccDeposited (leveraged long)
 -- where P_mat = CC price at maturity, K = strike price (in USD)
+--
+-- Note on denominator: the issue spec states "/ CC_price_at_split" but that
+-- produces P_mat/P_split × ccDeposited as the sum (invariant only holds if
+-- P_mat = P_split). The correct denominator to preserve "P+N = ccDeposited"
+-- is P_mat. This matches Split Protocol (Base/Arbitrum) and Vitalik's original
+-- mechanism. USD value of P_CC = min(P_mat, K) (stable at strike); USD value
+-- of N_CC = max(0, P_mat − K) (leveraged); sum = P_mat = total USD value of
+-- 1 CC → dividing by P_mat gives exactly ccDeposited in CC terms.
 --
 -- Phase 1 scope: admin-custodied CC, manual oracle price submission,
 -- Canton TestNet. Phase 2 adds Amulet BurnMintV1 direct integration.
