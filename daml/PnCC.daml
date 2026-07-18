@@ -1,0 +1,332 @@
+-- P_CC / N_CC: option-based synthetic stable on Canton
+-- Mechanism: Vitalik Buterin's P/N token split applied to Canton Coin (CC)
+--
+-- Split invariant: P_CC payoff + N_CC payoff = ccDeposited (in CC terms)
+--   P_CC payoff = min(P_mat, K) / P_mat × ccDeposited   (stable, floored)
+--   N_CC payoff = max(0, P_mat − K) / P_mat × ccDeposited (leveraged long)
+-- where P_mat = CC price at maturity, K = strike price (in USD)
+--
+-- Phase 1 scope: admin-custodied CC, manual oracle price submission,
+-- Canton TestNet. Phase 2 adds Amulet BurnMintV1 direct integration.
+
+module PnCC where
+
+import DA.Date (Date)
+import DA.Time (Time)
+import Daml.Script
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PriceObservation
+-- Submitted by the oracle party. In Phase 1 this is manual (Chainlink simulation).
+-- Phase 3 will automate via Chainlink Data Streams on Canton mainnet.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template PriceObservation
+  with
+    admin      : Party    -- admin who receives the observation
+    oracle     : Party    -- submitting party (Chainlink or simulation)
+    seriesId   : Text     -- ties observation to a specific SplitSeries
+    price      : Decimal  -- USD price of CC at observation time (e.g. 0.156703)
+    observedAt : Time     -- Canton ledger time of submission
+  where
+    signatory oracle
+    observer admin
+
+    -- Admin can retire a superseded or erroneous observation.
+    -- The authoritative maturity price lives in SettlementPool.
+    choice PriceObservation_Archive : ()
+      controller admin
+      do pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SplitSeries
+-- Immutable series configuration. Created once by admin, never modified.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template SplitSeries
+  with
+    admin        : Party
+    oracle       : Party
+    seriesId     : Text     -- unique identifier e.g. "CC-7D-012-20260625"
+    strikePrice  : Decimal  -- K in USD (e.g. 0.12)
+    splitPrice   : Decimal  -- P_0: CC price at series creation time
+    maturityDate : Date     -- settlement date (Canton date)
+    description  : Text     -- human-readable e.g. "7-day $0.12 strike"
+  where
+    signatory admin
+    observer oracle
+
+    -- Series config is append-only; only admin can archive (end the series).
+    choice SplitSeries_Close : ()
+      controller admin
+      do pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SettlementPool
+-- Admin creates this at maturity to announce the final settlement price
+-- and record total CC available for distribution. One pool per series.
+-- Token holders reference this to verify the maturity price.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template SettlementPool
+  with
+    admin         : Party
+    seriesId      : Text
+    maturityPrice : Decimal  -- final oracle price (from PriceObservation)
+    strikePrice   : Decimal  -- K, copied from SplitSeries
+    totalCC       : Decimal  -- total CC locked in this series at split time
+    openedAt      : Time     -- time admin opened settlement
+  where
+    signatory admin
+
+    ensure maturityPrice > 0.0 && totalCC > 0.0
+
+    -- Admin closes the pool once all claims are paid.
+    choice SettlementPool_Close : ()
+      controller admin
+      do pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SettlementClaim
+-- Created when a token holder burns their P_CC or N_CC at maturity.
+-- Admin processes off-chain CC transfer and calls MarkPaid to archive.
+-- Phase 2: MarkPaid will trigger an Amulet BurnMintV1 transfer inline.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template SettlementClaim
+  with
+    claimant  : Party
+    admin     : Party
+    seriesId  : Text
+    tokenSide : Text     -- "P_CC" or "N_CC", for admin bookkeeping
+    ccAmount  : Decimal  -- CC owed to claimant (may be 0 for underwater N_CC)
+  where
+    signatory admin
+    observer claimant
+
+    -- Admin marks this claim as paid after transferring CC off-chain.
+    -- Archiving this contract is the on-ledger acknowledgement of payment.
+    choice SettlementClaim_MarkPaid : ()
+      controller admin
+      do pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MergeClaim
+-- Created when both P_CC and N_CC tokens are returned before maturity.
+-- Holder recovers original CC deposit (no payoff formula applied).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template MergeClaim
+  with
+    claimant : Party
+    admin    : Party
+    seriesId : Text
+    ccAmount : Decimal  -- original CC to return (= ccDeposited)
+  where
+    signatory admin
+    observer claimant
+
+    choice MergeClaim_MarkPaid : ()
+      controller admin
+      do pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- P_CC — Stable (principal) side token
+--
+-- Payoff formula: min(P_mat, K) / P_mat × ccDeposited
+--
+-- Properties:
+--   • When P_mat ≥ K (normal): P_CC returns K/P_mat × ccDeposited CC
+--     (USD value = K, stable at strike)
+--   • When P_mat < K (CC crashes): P_CC returns ccDeposited CC
+--     (all CC goes to P_CC holder; N_CC is worthless)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template PCC
+  with
+    owner       : Party
+    admin       : Party
+    seriesId    : Text
+    ccDeposited : Decimal  -- CC locked at split (backing this token pair)
+    strikePrice : Decimal  -- K, cached from SplitSeries at mint time
+    splitPrice  : Decimal  -- P_0, cached from SplitSeries at mint time
+  where
+    signatory admin        -- admin issues and controls the token
+    observer owner
+
+    ensure ccDeposited > 0.0 && strikePrice > 0.0 && splitPrice > 0.0
+
+    -- P2P transfer. In Phase 4 this enables secondary markets (OneSwap/Cantex).
+    choice PCC_Transfer : ContractId PCC
+      with newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    -- Burn P_CC at maturity and create a SettlementClaim.
+    -- Uses the SettlementPool's maturityPrice to compute payout.
+    -- Invariant check: payout for P + N = ccDeposited ✓ (enforced by formula)
+    choice PCC_ClaimSettlement : ContractId SettlementClaim
+      with poolCid : ContractId SettlementPool
+      controller owner
+      do
+        pool <- fetch poolCid
+        assertMsg "PCC settlement: series ID mismatch with pool"
+                  (pool.seriesId == seriesId)
+        assertMsg "PCC settlement: pool maturity price must be positive"
+                  (pool.maturityPrice > 0.0)
+        let matPrice = pool.maturityPrice
+            k        = strikePrice
+            ccOut    = (min matPrice k / matPrice) * ccDeposited
+        create SettlementClaim with
+          claimant  = owner
+          admin     = admin
+          seriesId  = seriesId
+          tokenSide = "P_CC"
+          ccAmount  = ccOut
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- N_CC — Leveraged long side token
+--
+-- Payoff formula: max(0, P_mat − K) / P_mat × ccDeposited
+--
+-- Properties:
+--   • When P_mat > K: N_CC returns (P_mat−K)/P_mat × ccDeposited CC
+--     (leveraged upside, loses capital to P_CC at low prices)
+--   • When P_mat ≤ K: N_CC returns 0 (worthless; all CC to P_CC)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template NCC
+  with
+    owner       : Party
+    admin       : Party
+    seriesId    : Text
+    ccDeposited : Decimal
+    strikePrice : Decimal
+    splitPrice  : Decimal
+  where
+    signatory admin
+    observer owner
+
+    ensure ccDeposited > 0.0 && strikePrice > 0.0 && splitPrice > 0.0
+
+    choice NCC_Transfer : ContractId NCC
+      with newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    choice NCC_ClaimSettlement : ContractId SettlementClaim
+      with poolCid : ContractId SettlementPool
+      controller owner
+      do
+        pool <- fetch poolCid
+        assertMsg "NCC settlement: series ID mismatch with pool"
+                  (pool.seriesId == seriesId)
+        assertMsg "NCC settlement: pool maturity price must be positive"
+                  (pool.maturityPrice > 0.0)
+        let matPrice = pool.maturityPrice
+            k        = strikePrice
+            -- max 0 guards against rounding artefacts where matPrice ≈ k
+            ccOut    = (max 0.0 (matPrice - k) / matPrice) * ccDeposited
+        create SettlementClaim with
+          claimant  = owner
+          admin     = admin
+          seriesId  = seriesId
+          tokenSide = "N_CC"
+          ccAmount  = ccOut
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SplitFactory
+-- Persistent factory contract. Admin exercises Split/Merge here.
+-- Phase 1: admin co-signs all operations (verifies off-chain CC receipt).
+-- Phase 2: Split/Merge will use Amulet BurnMintV1 for trustless custody.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+template SplitFactory
+  with
+    admin  : Party
+    oracle : Party
+  where
+    signatory admin
+    observer oracle
+
+    -- Deposit CC → receive 1 P_CC + 1 N_CC (same ccDeposited backing both).
+    -- Admin exercises this after confirming off-chain CC receipt from depositor.
+    nonconsuming choice SplitFactory_Split
+      : (ContractId PCC, ContractId NCC)
+      with
+        depositor   : Party
+        seriesId    : Text
+        ccDeposited : Decimal  -- CC amount deposited (verified off-chain)
+        strikePrice : Decimal  -- from the corresponding SplitSeries
+        splitPrice  : Decimal  -- from the corresponding SplitSeries
+      controller admin
+      do
+        assertMsg "Split: CC amount must be positive" (ccDeposited > 0.0)
+        pCid <- create PCC with
+          owner = depositor; admin = admin; seriesId = seriesId
+          ccDeposited = ccDeposited; strikePrice = strikePrice
+          splitPrice = splitPrice
+        nCid <- create NCC with
+          owner = depositor; admin = admin; seriesId = seriesId
+          ccDeposited = ccDeposited; strikePrice = strikePrice
+          splitPrice = splitPrice
+        return (pCid, nCid)
+
+    -- Return P_CC + N_CC → recover original CC deposit (pre-maturity only).
+    -- Both tokens must be from the same series and owned by the same party.
+    nonconsuming choice SplitFactory_Merge
+      : ContractId MergeClaim
+      with
+        pCid : ContractId PCC
+        nCid : ContractId NCC
+      controller admin
+      do
+        p <- fetch pCid
+        n <- fetch nCid
+        assertMsg "Merge: P_CC and N_CC series must match" (p.seriesId == n.seriesId)
+        assertMsg "Merge: backing CC must match" (p.ccDeposited == n.ccDeposited)
+        assertMsg "Merge: P_CC and N_CC must have the same owner"
+                  (p.owner == n.owner)
+        archive pCid
+        archive nCid
+        create MergeClaim with
+          claimant = p.owner
+          admin    = admin
+          seriesId = p.seriesId
+          ccAmount = p.ccDeposited
+
+    -- Admin can submit a new PriceObservation on behalf of the oracle party.
+    -- This is the manual Chainlink simulation path for Phase 1.
+    -- Phase 3 replaces this with automated Chainlink Data Streams.
+    nonconsuming choice SplitFactory_SubmitOraclePrice
+      : ContractId PriceObservation
+      with
+        seriesId   : Text
+        price      : Decimal
+        observedAt : Time
+      controller oracle
+      do
+        assertMsg "Oracle price must be positive" (price > 0.0)
+        create PriceObservation with
+          admin = admin; oracle = oracle; seriesId = seriesId
+          price = price; observedAt = observedAt
+
+    -- Admin opens settlement for a series using a verified oracle price.
+    nonconsuming choice SplitFactory_OpenSettlement
+      : ContractId SettlementPool
+      with
+        seriesId      : Text
+        maturityPrice : Decimal
+        strikePrice   : Decimal
+        totalCC       : Decimal
+        openedAt      : Time
+      controller admin
+      do
+        assertMsg "Settlement: maturity price must be positive" (maturityPrice > 0.0)
+        assertMsg "Settlement: totalCC must be positive" (totalCC > 0.0)
+        create SettlementPool with
+          admin = admin; seriesId = seriesId
+          maturityPrice = maturityPrice; strikePrice = strikePrice
+          totalCC = totalCC; openedAt = openedAt

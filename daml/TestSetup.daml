@@ -1,0 +1,211 @@
+-- Phase 1 TestNet setup script
+-- Demonstrates full split → hold → settle lifecycle for CC-7D-012-20260625
+-- Test series: 7-day, $0.12 strike, split price $0.156703
+--
+-- Run with: daml script --dar .daml/dist/pn-cc-0.1.0.dar \
+--             --script-name TestSetup:fullLifecycle \
+--             --ledger-host <canton-testnet-host> \
+--             --ledger-port <port>
+
+module TestSetup where
+
+import PnCC
+import DA.Date (date, Month(..))
+import DA.Time (time, datetime)
+import Daml.Script
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Expected P_CC payout: min(P_mat, K) / P_mat × ccDeposited
+expectedPCCPayout : Decimal -> Decimal -> Decimal -> Decimal
+expectedPCCPayout matPrice strike ccDep =
+  (min matPrice strike / matPrice) * ccDep
+
+-- Expected N_CC payout: max(0, P_mat − K) / P_mat × ccDeposited
+expectedNCCPayout : Decimal -> Decimal -> Decimal -> Decimal
+expectedNCCPayout matPrice strike ccDep =
+  (max 0.0 (matPrice - strike) / matPrice) * ccDep
+
+-- Sanity: P + N should equal ccDeposited (within Numeric 10 rounding)
+assertInvariant : Decimal -> Decimal -> Decimal -> Script ()
+assertInvariant matPrice strike ccDep = do
+  let pPay = expectedPCCPayout matPrice strike ccDep
+      nPay = expectedNCCPayout matPrice strike ccDep
+      total = pPay + nPay
+  -- Allow 1e-9 tolerance for fixed-point arithmetic
+  assertMsg ("Invariant violation: P+N = " <> show total <> " ≠ " <> show ccDep)
+            (total >= ccDep - 0.000000001 && total <= ccDep + 0.000000001)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- fullLifecycle: complete split → transfer → settle flow
+-- ─────────────────────────────────────────────────────────────────────────────
+
+fullLifecycle : Script ()
+fullLifecycle = script do
+  -- ── Parties ──────────────────────────────────────────────────────────────
+  admin  <- allocatePartyWithHint "PnCC-Admin"  (PartyIdHint "PnCC-Admin")
+  oracle <- allocatePartyWithHint "PnCC-Oracle" (PartyIdHint "PnCC-Oracle")
+  alice  <- allocatePartyWithHint "Alice"       (PartyIdHint "Alice")
+  bob    <- allocatePartyWithHint "Bob"         (PartyIdHint "Bob")
+
+  -- ── Series parameters ─────────────────────────────────────────────────────
+  let seriesId    = "CC-7D-012-20260625"
+      strikePrice = 0.12       -- K = $0.12 (deep ITM for max stability)
+      splitPrice  = 0.156703   -- P_0 at series creation (Jun 18 2026)
+      matDate     = date 2026 Jun 25
+
+  -- ── Create SplitFactory ───────────────────────────────────────────────────
+  factoryCid <- submit admin do
+    createCmd SplitFactory with admin = admin; oracle = oracle
+
+  -- ── Create SplitSeries ────────────────────────────────────────────────────
+  _seriesCid <- submit admin do
+    createCmd SplitSeries with
+      admin        = admin
+      oracle       = oracle
+      seriesId     = seriesId
+      strikePrice  = strikePrice
+      splitPrice   = splitPrice
+      maturityDate = matDate
+      description  = "7-day $0.12 strike CC split — Phase 1 MVP TestNet"
+
+  -- ── Alice splits 1000 CC ─────────────────────────────────────────────────
+  -- (Admin has received 1000 CC from Alice off-chain before exercising this)
+  (alicePCid, aliceNCid) <- submit admin do
+    exerciseCmd factoryCid SplitFactory_Split with
+      depositor   = alice
+      seriesId    = seriesId
+      ccDeposited = 1000.0
+      strikePrice = strikePrice
+      splitPrice  = splitPrice
+
+  -- ── Alice transfers N_CC to Bob ───────────────────────────────────────────
+  bobNCid <- submit alice do
+    exerciseCmd aliceNCid NCC_Transfer with newOwner = bob
+
+  -- ── Oracle submits maturity price at settlement ────────────────────────────
+  -- Test scenario: CC price rose to $0.18 (above strike $0.12)
+  -- P_CC payoff = min(0.18, 0.12) / 0.18 × 1000 = 0.12/0.18 × 1000 = 666.67 CC
+  -- N_CC payoff = max(0, 0.18 − 0.12) / 0.18 × 1000 = 0.06/0.18 × 1000 = 333.33 CC
+  -- Total = 1000.0 CC ✓
+  let maturityPrice = 0.18
+  _ <- assertInvariant maturityPrice strikePrice 1000.0
+
+  now <- getTime
+  _obsCid <- submit oracle do
+    exerciseCmd factoryCid SplitFactory_SubmitOraclePrice with
+      seriesId   = seriesId
+      price      = maturityPrice
+      observedAt = now
+
+  -- ── Admin opens settlement ────────────────────────────────────────────────
+  poolCid <- submit admin do
+    exerciseCmd factoryCid SplitFactory_OpenSettlement with
+      seriesId      = seriesId
+      maturityPrice = maturityPrice
+      strikePrice   = strikePrice
+      totalCC       = 1000.0
+      openedAt      = now
+
+  -- ── Alice claims P_CC settlement ──────────────────────────────────────────
+  -- Expected: min(0.18, 0.12) / 0.18 × 1000 = 666.666... CC
+  alicePClaimCid <- submit alice do
+    exerciseCmd alicePCid PCC_ClaimSettlement with poolCid = poolCid
+
+  -- ── Bob claims N_CC settlement ────────────────────────────────────────────
+  -- Expected: max(0, 0.18 − 0.12) / 0.18 × 1000 = 333.333... CC
+  bobNClaimCid <- submit bob do
+    exerciseCmd bobNCid NCC_ClaimSettlement with poolCid = poolCid
+
+  -- ── Admin pays both claims (off-chain CC transfer done) ──────────────────
+  submit admin do exerciseCmd alicePClaimCid SettlementClaim_MarkPaid
+  submit admin do exerciseCmd bobNClaimCid   SettlementClaim_MarkPaid
+
+  -- ── Admin closes settlement pool ─────────────────────────────────────────
+  submit admin do exerciseCmd poolCid SettlementPool_Close
+
+  pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- mergeTest: split then merge (pre-maturity unwind)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+mergeTest : Script ()
+mergeTest = script do
+  admin  <- allocatePartyWithHint "PnCC-Admin-M"  (PartyIdHint "PnCC-Admin-M")
+  oracle <- allocatePartyWithHint "PnCC-Oracle-M" (PartyIdHint "PnCC-Oracle-M")
+  carol  <- allocatePartyWithHint "Carol"         (PartyIdHint "Carol")
+
+  let seriesId    = "CC-7D-012-MERGE"
+      strikePrice = 0.12
+      splitPrice  = 0.156703
+
+  factoryCid <- submit admin do
+    createCmd SplitFactory with admin = admin; oracle = oracle
+
+  (carolPCid, carolNCid) <- submit admin do
+    exerciseCmd factoryCid SplitFactory_Split with
+      depositor = carol; seriesId = seriesId
+      ccDeposited = 500.0; strikePrice = strikePrice; splitPrice = splitPrice
+
+  -- Carol changes her mind and merges before maturity
+  mergeCid <- submit admin do
+    exerciseCmd factoryCid SplitFactory_Merge with
+      pCid = carolPCid; nCid = carolNCid
+
+  -- Admin returns 500 CC to Carol (off-chain), then marks claim paid
+  submit admin do exerciseCmd mergeCid MergeClaim_MarkPaid
+
+  pure ()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- belowStrikeTest: CC price crashes below strike → N_CC worthless
+-- ─────────────────────────────────────────────────────────────────────────────
+
+belowStrikeTest : Script ()
+belowStrikeTest = script do
+  admin  <- allocatePartyWithHint "PnCC-Admin-BS"  (PartyIdHint "PnCC-Admin-BS")
+  oracle <- allocatePartyWithHint "PnCC-Oracle-BS" (PartyIdHint "PnCC-Oracle-BS")
+  dan    <- allocatePartyWithHint "Dan"             (PartyIdHint "Dan")
+
+  let seriesId    = "CC-7D-012-CRASH"
+      strikePrice = 0.12
+      splitPrice  = 0.156703
+
+  factoryCid <- submit admin do
+    createCmd SplitFactory with admin = admin; oracle = oracle
+
+  (danPCid, danNCid) <- submit admin do
+    exerciseCmd factoryCid SplitFactory_Split with
+      depositor = dan; seriesId = seriesId
+      ccDeposited = 200.0; strikePrice = strikePrice; splitPrice = splitPrice
+
+  -- CC crashes to $0.08 (below $0.12 strike — 2σ floor breached)
+  let maturityPrice = 0.08
+  -- P_CC payoff = min(0.08, 0.12) / 0.08 × 200 = 0.08/0.08 × 200 = 200.0 CC (all)
+  -- N_CC payoff = max(0, 0.08 − 0.12) / 0.08 × 200 = 0.0 CC (worthless)
+  _ <- assertInvariant maturityPrice strikePrice 200.0
+
+  now <- getTime
+  _obsCid <- submit oracle do
+    exerciseCmd factoryCid SplitFactory_SubmitOraclePrice with
+      seriesId = seriesId; price = maturityPrice; observedAt = now
+
+  poolCid <- submit admin do
+    exerciseCmd factoryCid SplitFactory_OpenSettlement with
+      seriesId = seriesId; maturityPrice = maturityPrice
+      strikePrice = strikePrice; totalCC = 200.0; openedAt = now
+
+  -- Dan claims both P_CC (gets all 200 CC) and N_CC (gets 0 CC)
+  danPClaimCid <- submit dan do
+    exerciseCmd danPCid PCC_ClaimSettlement with poolCid = poolCid
+  danNClaimCid <- submit dan do
+    exerciseCmd danNCid NCC_ClaimSettlement with poolCid = poolCid
+
+  submit admin do exerciseCmd danPClaimCid SettlementClaim_MarkPaid
+  submit admin do exerciseCmd danNClaimCid SettlementClaim_MarkPaid
+  submit admin do exerciseCmd poolCid SettlementPool_Close
+
+  pure ()

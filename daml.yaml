@@ -1,0 +1,10 @@
+sdk-version: 2.9.4
+name: pn-cc
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+build-options:
+  - --target=2.1
